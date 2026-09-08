@@ -1,0 +1,27 @@
+# Compiled objects and libraries
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+*.out
+*.exe
+
+# Device-side tweak build
+rec3g.dylib
+
+# Screen recordings and raw captures
+*.mp4
+*.mov
+*.rec
+*.raw
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS / editor
+.DS_Store
+*~
+*.swp

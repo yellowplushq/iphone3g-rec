@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""
+rec3g — record the screen of a jailbroken iPhone 3G (iOS 4.2.1) over the cable.
+
+The phone runs rec3g.dylib, a MobileSubstrate tweak inside SpringBoard that
+idles on loopback and streams raw framebuffer rows to whoever connects. usbmuxd
+bridges that port over USB, so recording is just a TCP read; nothing goes over
+the network and nothing is written to the phone's flash.
+
+It has to live inside SpringBoard: from any other process the framebuffer
+surface is frozen at whatever it held when SpringBoard started. Veency and
+Display Recorder are tweaks for the same reason. See rec3gsb.c.
+
+    rec3g install                     # build on the phone, install, respring
+    rec3g record -o demo.mp4          # record until Ctrl-C
+    rec3g record -o demo.mp4 -s 30    # or for a fixed 30 seconds
+    rec3g uninstall
+
+Recording needs ffmpeg; installing needs sshpass and libimobiledevice (iproxy).
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SOURCE = os.path.join(HERE, "rec3gsb.c")
+PLIST = os.path.join(HERE, "rec3g.plist")
+
+UDID = "6b34e9044dab673f43fdfc6c1acdf0b4f670f890"
+STREAM_PORT = 5999
+SSH_PORT = 2222
+TWEAK_DIR = "/Library/MobileSubstrate/DynamicLibraries"
+REMOTE_DYLIB = TWEAK_DIR + "/rec3g.dylib"
+REMOTE_PLIST = TWEAK_DIR + "/rec3g.plist"
+BUILD_DIR = "/var/airbuild/rec3g"
+
+# iOS 4.2.1's OpenSSH predates every default a current client offers, so the old
+# algorithms have to be named explicitly.
+SSH_OPTS = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "HostKeyAlgorithms=+ssh-rsa",
+    "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+    "-o", "KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1",
+    "-o", "Ciphers=+aes128-cbc,3des-cbc",
+    "-o", "LogLevel=ERROR",
+]
+
+
+def fail(message):
+    sys.exit("rec3g: " + message)
+
+
+def need_tools(*tools):
+    for tool in tools:
+        if not shutil.which(tool):
+            fail("%s not found in PATH" % tool)
+
+
+class Device:
+    def __init__(self, args):
+        self.udid = args.udid
+        self.password = args.password
+        self.env = dict(os.environ, SSHPASS=args.password)
+
+    def _ssh_argv(self, extra=()):
+        return (["sshpass", "-e", "ssh", "-p", str(SSH_PORT)] + list(extra) +
+                SSH_OPTS + ["root@127.0.0.1"])
+
+    def _attempt(self, argv, capture):
+        """Run one ssh/scp, rebuilding the forward if the transport itself failed.
+
+        The USB forward drops often — a respring is usually enough to kill it —
+        and ssh reports that as exit 255, distinct from any exit code the remote
+        command could return. So 255 alone is worth a rebuild and one retry.
+        """
+        done = subprocess.run(argv, env=self.env, capture_output=capture, text=capture)
+        if done.returncode == 255:
+            reset_tunnel(self.udid, SSH_PORT, 22)
+            done = subprocess.run(argv, env=self.env, capture_output=capture, text=capture)
+        return done
+
+    def run(self, command, check=True):
+        done = self._attempt(self._ssh_argv() + [command], False)
+        if check and done.returncode != 0:
+            fail("command failed on the phone: %s" % command)
+        return done
+
+    def capture(self, command):
+        return self._attempt(self._ssh_argv() + [command], True).stdout.strip()
+
+    def push(self, local, remote):
+        argv = (["sshpass", "-e", "scp", "-P", str(SSH_PORT), "-O"] + SSH_OPTS +
+                [local, "root@127.0.0.1:" + remote])
+        if self._attempt(argv, False).returncode != 0:
+            fail("could not copy %s to the phone" % os.path.basename(local))
+
+
+def port_open(port):
+    with socket.socket() as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def ensure_tunnel(udid, port, remote_port):
+    """usbmuxd carries the port over the cable; start the forward if it isn't up."""
+    if port_open(port):
+        return
+    need_tools("iproxy")
+    subprocess.Popen(["iproxy", "-u", udid, "%d:%d" % (port, remote_port)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(24):
+        time.sleep(0.25)
+        if port_open(port):
+            return
+    fail("no USB tunnel on port %d — is the phone plugged in and unlocked?" % port)
+
+
+def install(args):
+    need_tools("sshpass", "iproxy")
+    for path in (SOURCE, PLIST):
+        if not os.path.exists(path):
+            fail("%s is missing next to this script" % os.path.basename(path))
+    ensure_tunnel(args.udid, SSH_PORT, 22)
+    device = Device(args)
+
+    if not device.capture("test -f /etc/profile.d/airbuild.sh && echo ok"):
+        fail("the AirBuild Legacy environment is not installed on the phone — "
+             "open AirBuild Legacy, Settings > Environment > Install")
+
+    print("rec3g: building the tweak on the phone…")
+    device.run("mkdir -p %s" % BUILD_DIR)
+    device.push(SOURCE, BUILD_DIR + "/rec3gsb.c")
+    build = (". /etc/profile.d/airbuild.sh; cd %s && "
+             "gcc $IOS_CFLAGS -O2 -dynamiclib -nostartfiles $SDKROOT/usr/lib/dylib1.o "
+             "-o rec3g.dylib rec3gsb.c $IOS_LDFLAGS -framework CoreFoundation && "
+             "ldid -S rec3g.dylib" % BUILD_DIR)
+    if device.run(build, check=False).returncode != 0:
+        fail("build failed on the device")
+
+    print("rec3g: installing into SpringBoard…")
+    # Delete before copying. Overwriting reuses the inode and iOS keeps the old
+    # binary's signature cached against it, so the new one is SIGKILLed at load
+    # with no diagnostic at all.
+    device.run("rm -f %s %s" % (REMOTE_DYLIB, REMOTE_PLIST))
+    device.run("cp %s/rec3g.dylib %s && chmod 755 %s"
+               % (BUILD_DIR, REMOTE_DYLIB, REMOTE_DYLIB))
+    device.push(PLIST, REMOTE_PLIST)
+    device.run("chown root:wheel %s && chmod 644 %s" % (REMOTE_PLIST, REMOTE_PLIST))
+
+    respring(device)
+    ensure_tunnel(args.udid, STREAM_PORT, STREAM_PORT)
+    print("rec3g: installed and listening on port %d." % STREAM_PORT)
+
+
+def respring(device):
+    """Restart SpringBoard and wait for the tweak to start listening.
+
+    launchd on this device does not reliably bring SpringBoard back on its own
+    after a kill — it has been left down for long stretches, which looks exactly
+    like a broken capture because the framebuffer really is black with nothing
+    drawing. So start it explicitly and confirm.
+    """
+    print("rec3g: respringing…")
+    device.run("killall SpringBoard 2>/dev/null; true", check=False)
+    for _ in range(12):
+        time.sleep(2.5)
+        if device.capture("ps ax | grep -c '[S]pringBoard.app/SpringBoard'") != "0":
+            break
+        device.run("launchctl start com.apple.SpringBoard 2>/dev/null; true", check=False)
+    else:
+        fail("SpringBoard did not come back — run 'launchctl start "
+             "com.apple.SpringBoard' on the phone")
+
+    # The tweak waits for SpringBoard to settle before it opens the display.
+    for _ in range(16):
+        if device.capture("netstat -an | grep -c '127.0.0.1.%d.*LISTEN'" % STREAM_PORT) != "0":
+            return
+        time.sleep(2)
+    fail("the tweak did not start listening — check /tmp/rec3g.log on the phone")
+
+
+def uninstall(args):
+    need_tools("sshpass", "iproxy")
+    ensure_tunnel(args.udid, SSH_PORT, 22)
+    device = Device(args)
+    device.run("rm -f %s %s /tmp/rec3g.log" % (REMOTE_DYLIB, REMOTE_PLIST), check=False)
+    device.run("rm -rf %s" % BUILD_DIR, check=False)
+    device.run("killall SpringBoard 2>/dev/null; true", check=False)
+    time.sleep(4)
+    device.run("launchctl start com.apple.SpringBoard 2>/dev/null; true", check=False)
+    print("rec3g: removed from the phone and resprung.")
+
+
+def reset_tunnel(udid, port, remote_port):
+    """Tear the forward down and build it again.
+
+    A live iproxy accepts every connection whether or not it can reach the
+    phone, so a dead forward looks exactly like a healthy one — checking the
+    port proves nothing. After a respring the old forward is usually dead, and
+    the only honest test is whether bytes arrive.
+    """
+    subprocess.run(["pkill", "-f", "iproxy -u %s %d:%d" % (udid, port, remote_port)],
+                   capture_output=True)
+    time.sleep(1)
+    ensure_tunnel(udid, port, remote_port)
+
+
+def connect_stream(args):
+    """Connect and read the header, rebuilding the forward if nothing arrives."""
+    last = None
+    for attempt in range(3):
+        if attempt:
+            reset_tunnel(args.udid, STREAM_PORT, STREAM_PORT)
+        else:
+            ensure_tunnel(args.udid, STREAM_PORT, STREAM_PORT)
+        try:
+            link = socket.create_connection(("127.0.0.1", STREAM_PORT), timeout=10)
+            link.settimeout(6.0)
+            header = b""
+            while len(header) < 24:
+                chunk = link.recv(24 - len(header))
+                if not chunk:
+                    raise OSError("connection closed during the header")
+                header += chunk
+            if header[:4] != b"R3G2":
+                fail("unexpected stream header")
+            return link, header
+        except (OSError, socket.timeout) as error:
+            last = error
+            try:
+                link.close()
+            except Exception:
+                pass
+    fail("cannot reach the tweak (%s) — run 'rec3g install' first" % last)
+
+
+class FrameCounter:
+    """Parse the stream as it arrives, so progress can report real capture.
+
+    Byte rate alone is misleading: a still screen costs nothing but heartbeats,
+    so 0.1 MB/s can mean either "nothing is happening" or "capture is broken",
+    and previously that only became visible after encoding. Counting frames live
+    tells the two apart while there is still time to do something about it.
+    """
+
+    def __init__(self, stride):
+        self.stride = stride
+        self.buffer = b""
+        self.runs_left = 0
+        self.skip = 0
+        self.frames = 0
+        self.first_frame_blank = None
+        self._inspecting = False
+
+    def feed(self, data):
+        self.buffer += data
+        while True:
+            if self.skip:
+                take = min(self.skip, len(self.buffer))
+                if self._inspecting and any(self.buffer[:take]):
+                    self.first_frame_blank = False
+                    self._inspecting = False
+                self.buffer = self.buffer[take:]
+                self.skip -= take
+                if self.skip:
+                    return
+                if self.runs_left == 0 and self.first_frame_blank is None:
+                    self.first_frame_blank = self._inspecting
+                    self._inspecting = False
+                continue
+            if self.runs_left:
+                if len(self.buffer) < 8:
+                    return
+                _first_row, rows = struct.unpack_from("<2I", self.buffer, 0)
+                self.buffer = self.buffer[8:]
+                self.skip = rows * self.stride
+                self.runs_left -= 1
+                continue
+            if len(self.buffer) < 8:
+                return
+            _timestamp, runs = struct.unpack_from("<2I", self.buffer, 0)
+            self.buffer = self.buffer[8:]
+            if runs:
+                self.frames += 1
+                self.runs_left = runs
+                if self.frames == 1:
+                    self._inspecting = True
+
+
+def stream(args, raw_path):
+    """Read the tweak's stream to a local file until Ctrl-C or the time is up."""
+    link, header = connect_stream(args)
+    link.settimeout(1.0)
+    width, height, stride, _bpp, fps = struct.unpack_from("<5I", header, 4)
+    counter = FrameCounter(stride)
+    warned = False
+
+    if args.seconds:
+        print("rec3g: recording %dx%d at %d fps for %d seconds…"
+              % (width, height, fps, args.seconds))
+    else:
+        print("rec3g: recording %dx%d at %d fps — press Ctrl-C to stop."
+              % (width, height, fps))
+
+    total = 0
+    started = time.time()
+    with open(raw_path, "wb") as out:
+        out.write(header)
+        try:
+            while True:
+                if args.seconds and time.time() - started >= args.seconds:
+                    break
+                try:
+                    chunk = link.recv(1 << 16)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                out.write(chunk)
+                counter.feed(chunk)
+                total += len(chunk)
+                elapsed = time.time() - started
+                if counter.first_frame_blank and not warned:
+                    warned = True
+                    print("\rrec3g: the screen is black — wake the phone now; "
+                          "the recording is already running.")
+                sys.stdout.write("\rrec3g: %5.1fs  %5d frames  %6.1f MB  %4.1f MB/s"
+                                 % (elapsed, counter.frames, total / 1e6,
+                                    total / 1e6 / max(elapsed, 0.1)))
+                sys.stdout.flush()
+        except KeyboardInterrupt:
+            pass
+    print()
+    link.close()
+    return time.time() - started
+
+
+def encode(raw_path, out_path, out_fps, crf):
+    """Replay the row deltas onto a canvas and feed constant-rate frames to ffmpeg.
+
+    The stream is variable-rate by design — a still screen sends nothing — so
+    each output tick repeats whatever the canvas held at that moment. That is
+    what keeps motion in the video at the speed it happened on the phone.
+    """
+    with open(raw_path, "rb") as handle:
+        blob = handle.read()
+    if len(blob) < 24 or blob[:4] != b"R3G2":
+        fail("%s is not a rec3g capture" % raw_path)
+    width, height, stride, bpp, _fps = struct.unpack_from("<5I", blob, 4)
+    if not width or not height or stride < width * bpp:
+        fail("capture header is corrupt")
+
+    # The tweak sends RGB565 to halve the bandwidth; 4 bytes means an older capture.
+    pixel_format = {2: "rgb565le", 4: "bgra"}.get(bpp)
+    if not pixel_format:
+        fail("unsupported pixel size in capture: %d bytes" % bpp)
+
+    ffmpeg = subprocess.Popen(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", pixel_format,
+         "-s", "%dx%d" % (width, height), "-r", str(out_fps), "-i", "-",
+         "-c:v", "libx264", "-preset", "slow", "-crf", str(crf),
+         "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path],
+        stdin=subprocess.PIPE)
+
+    canvas = bytearray(stride * height)
+    packed = stride == width * bpp
+    step = 1000000.0 / out_fps
+    state = {"tick": 0}
+
+    def emit(until_us):
+        while state["tick"] * step < until_us:
+            if packed:
+                ffmpeg.stdin.write(canvas)
+            else:
+                for row in range(height):
+                    start = row * stride
+                    ffmpeg.stdin.write(canvas[start:start + width * bpp])
+            state["tick"] += 1
+
+    offset, frames, last_us = 24, 0, 0
+    try:
+        while offset + 8 <= len(blob):
+            timestamp, runs = struct.unpack_from("<2I", blob, offset)
+            offset += 8
+            emit(timestamp)
+            last_us = timestamp
+            if runs == 0:
+                continue  # heartbeat: it only carried the time
+            complete = True
+            for _ in range(runs):
+                if offset + 8 > len(blob):
+                    complete = False
+                    break
+                first_row, row_count = struct.unpack_from("<2I", blob, offset)
+                offset += 8
+                length = row_count * stride
+                if first_row + row_count > height or offset + length > len(blob):
+                    complete = False  # Ctrl-C can cut the last frame in half.
+                    break
+                canvas[first_row * stride:first_row * stride + length] = \
+                    blob[offset:offset + length]
+                offset += length
+            if not complete:
+                break
+            frames += 1
+        emit(last_us + step)  # give the final frame a duration of its own
+        ffmpeg.stdin.close()
+    except BrokenPipeError:
+        fail("ffmpeg exited early")
+    if ffmpeg.wait() != 0:
+        fail("ffmpeg failed")
+    return width, height, frames, state["tick"]
+
+
+def record(args):
+    need_tools("ffmpeg", "iproxy")
+    raw_path = args.keep or os.path.join("/tmp", "rec3g-%d.rec" % os.getpid())
+    elapsed = stream(args, raw_path)
+    size = os.path.getsize(raw_path)
+    if size <= 24:
+        fail("nothing was captured")
+
+    print("rec3g: %.1f MB in %.1fs, encoding…" % (size / 1e6, elapsed))
+    width, height, frames, ticks = encode(raw_path, args.output, args.out_fps, args.crf)
+    if not args.keep:
+        os.unlink(raw_path)
+    print("rec3g: %s — %dx%d, %d changed frames -> %d at %d fps (%.1fs)"
+          % (args.output, width, height, frames, ticks, args.out_fps,
+             ticks / float(args.out_fps)))
+    if frames <= 1:
+        # Nothing on the phone changed for the whole take. Almost always the
+        # screen was off — the framebuffer then freezes on its last image, or is
+        # black, and the recording "succeeds" into a still video. Nothing found
+        # so far can turn the screen on from code, so say it plainly.
+        print("rec3g: the screen never changed — it was most likely off or "
+              "asleep. Wake the phone before recording.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="rec3g", description="Record a jailbroken iPhone 3G screen over USB.")
+    parser.add_argument("--udid", default=UDID, help="device UDID")
+    parser.add_argument("--password", default="alpine", help="device root password")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("install", help="build and install the daemon on the phone")
+    sub.add_parser("uninstall", help="remove the daemon from the phone")
+
+    rec = sub.add_parser("record", help="record the screen to an MP4")
+    rec.add_argument("-o", "--output", default="iphone3g.mp4", help="MP4 to write")
+    rec.add_argument("-s", "--seconds", type=int, default=0,
+                     help="stop after N seconds (default: run until Ctrl-C)")
+    rec.add_argument("--out-fps", type=int, default=30, help="MP4 frame rate")
+    rec.add_argument("--crf", type=int, default=20, help="x264 quality")
+    rec.add_argument("--keep", metavar="FILE", help="also save the raw capture here")
+
+    args = parser.parse_args()
+    {"install": install, "uninstall": uninstall, "record": record}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
